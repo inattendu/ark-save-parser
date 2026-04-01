@@ -140,6 +140,8 @@ _LOGGABLE_COMPLEX = {ArkValueType.Struct, ArkValueType.Array, ArkValueType.Map, 
 # -------------------------------------------------------------------------------------------------
 @dataclass
 class ArkProperty:
+    _lightweight_mode = False  # Class-level flag: skip .bytes storage for read-only use
+
     name: str
     type: str
     value: Any
@@ -228,7 +230,8 @@ class ArkProperty:
             prop.nr_of_bytes = data_size
             prop.name_position = name_position
             prop.value_position = value_position
-            prop.bytes = byte_buffer.byte_buffer[name_position:byte_buffer.get_position()]
+            if not ArkProperty._lightweight_mode:
+                prop.bytes = byte_buffer.byte_buffer[name_position:byte_buffer.get_position()]
 
         return prop
 

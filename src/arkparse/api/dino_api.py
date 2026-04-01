@@ -158,7 +158,357 @@ class DinoApi:
         ArkSaveLogger.api_log(f"Parsed {len(dinos)} dinos")
 
         return dinos
-    
+
+    # ------------------------------------------------------------------
+    # Fast stat extraction helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_stat_pattern(save_context) -> tuple:
+        """Pre-compute binary search patterns for stat extraction."""
+        import struct
+        sc = save_context
+
+        def _nid(name):
+            nid = sc.get_name_id(name)
+            if nid is not None:
+                return struct.pack('<II', nid, 0)  # name_id + zero padding
+            return None
+
+        stat_name = _nid("NumberOfLevelUpPointsApplied")
+        stat_tamed = _nid("NumberOfLevelUpPointsAppliedTamed")
+        stat_mutated = _nid("NumberOfMutationsAppliedTamed")
+        byte_type = _nid("ByteProperty")
+        int_type = _nid("IntProperty")
+        float_type = _nid("FloatProperty")
+        base_level_name = _nid("BaseCharacterLevel")
+        imprint_name = _nid("DinoImprintingQuality")
+        status_name = _nid("CurrentStatusValues")
+
+        return {
+            "stat_base": (stat_name + byte_type) if (stat_name and byte_type) else None,
+            "stat_tamed": (stat_tamed + byte_type) if (stat_tamed and byte_type) else None,
+            "stat_mutated": (stat_mutated + byte_type) if (stat_mutated and byte_type) else None,
+            "base_level": (base_level_name + int_type) if (base_level_name and int_type) else None,
+            "imprint": (imprint_name + float_type) if (imprint_name and float_type) else None,
+            "status_values": (status_name + float_type) if (status_name and float_type) else None,
+        }
+
+    @staticmethod
+    def _extract_byte_stats(binary: bytes, pattern: bytes) -> dict:
+        """Extract ByteProperty stat points from binary by pattern scanning."""
+        import struct
+        stats = {}
+        pos = 0
+        while True:
+            pos = binary.find(pattern, pos)
+            if pos == -1:
+                break
+            # After 16-byte pattern: data_size(4) + header_position(4) + ByteProp value
+            offset = pos + 16
+            if offset + 10 > len(binary):
+                break
+            data_size = struct.unpack_from('<i', binary, offset)[0]
+            offset += 8  # skip data_size + header_position
+            if data_size == 0:  # non-enum ByteProperty
+                is_pos_flag = binary[offset]
+                if is_pos_flag == 1:
+                    stat_idx = struct.unpack_from('<i', binary, offset + 1)[0]
+                    value = binary[offset + 5]
+                else:
+                    stat_idx = 0
+                    value = binary[offset + 1]
+                if 0 <= stat_idx < 12:
+                    stats[stat_idx] = value
+            pos += 16
+        return stats
+
+    @staticmethod
+    def _extract_int_prop(binary: bytes, pattern: bytes) -> int:
+        """Extract a single IntProperty value from binary."""
+        import struct
+        pos = binary.find(pattern)
+        if pos == -1:
+            return 0
+        # After 16-byte pattern: data_size(4) + header_position(4) + unknown_byte(1) + int32
+        offset = pos + 16 + 8 + 1
+        if offset + 4 > len(binary):
+            return 0
+        return struct.unpack_from('<i', binary, offset)[0]
+
+    @staticmethod
+    def _extract_float_prop(binary: bytes, pattern: bytes, with_position: bool = False) -> object:
+        """Extract FloatProperty value(s) from binary.
+
+        If with_position=True, returns dict {position: float_value}.
+        Otherwise returns the first float found.
+        """
+        import struct
+        if with_position:
+            result = {}
+            pos = 0
+            while True:
+                pos = binary.find(pattern, pos)
+                if pos == -1:
+                    break
+                offset = pos + 16 + 8  # after pattern + data_size + header_position
+                if offset + 5 > len(binary):
+                    break
+                is_pos_flag = binary[offset]
+                if is_pos_flag == 1:
+                    idx = struct.unpack_from('<i', binary, offset + 1)[0]
+                    val = struct.unpack_from('<f', binary, offset + 5)[0]
+                    if 0 <= idx < 12:
+                        result[idx] = val
+                else:
+                    val = struct.unpack_from('<f', binary, offset + 1)[0]
+                    result[0] = val
+                pos += 16
+            return result
+        else:
+            pos = binary.find(pattern)
+            if pos == -1:
+                return 0.0
+            offset = pos + 16 + 8  # after pattern + data_size + header_position
+            if offset + 5 > len(binary):
+                return 0.0
+            is_pos_flag = binary[offset]
+            if is_pos_flag == 1:
+                return struct.unpack_from('<f', binary, offset + 5)[0]
+            else:
+                return struct.unpack_from('<f', binary, offset + 1)[0]
+
+    @staticmethod
+    def _stats_from_binary(binary: bytes, patterns: dict, is_tamed: bool = False):
+        """Build a DinoStats from raw binary without ArkGameObject parsing."""
+        from arkparse.object_model.dinos.stats import StatPoints, StatValues, \
+            DinoStats as ArkDinoStats, STAT_POSITION_MAP
+
+        # Base stat points (wild levels)
+        base_pts = StatPoints()
+        if patterns["stat_base"]:
+            raw = DinoApi._extract_byte_stats(binary, patterns["stat_base"])
+            for idx, attr in STAT_POSITION_MAP.items():
+                setattr(base_pts, attr, raw.get(idx, 0))
+
+        # Base level
+        base_level = 0
+        if patterns["base_level"]:
+            base_level = DinoApi._extract_int_prop(binary, patterns["base_level"])
+
+        ds = ArkDinoStats()
+        ds.base_level = base_level if base_level else 0
+        ds.base_stat_points = base_pts
+
+        # Tamed-specific stats
+        added_pts = StatPoints(type="NumberOfLevelUpPointsAppliedTamed")
+        mutated_pts = StatPoints(type="NumberOfMutationsAppliedTamed")
+        if is_tamed:
+            if patterns["stat_tamed"]:
+                raw = DinoApi._extract_byte_stats(binary, patterns["stat_tamed"])
+                for idx, attr in STAT_POSITION_MAP.items():
+                    setattr(added_pts, attr, raw.get(idx, 0))
+            if patterns["stat_mutated"]:
+                raw = DinoApi._extract_byte_stats(binary, patterns["stat_mutated"])
+                for idx, attr in STAT_POSITION_MAP.items():
+                    setattr(mutated_pts, attr, raw.get(idx, 0))
+            if patterns["imprint"]:
+                ds._percentage_imprinted = DinoApi._extract_float_prop(
+                    binary, patterns["imprint"]) * 100
+            else:
+                ds._percentage_imprinted = 0.0
+        else:
+            ds._percentage_imprinted = 0.0
+
+        ds.added_stat_points = added_pts
+        ds.mutated_stat_points = mutated_pts
+
+        # Current level
+        ds.current_level = (base_pts.get_level() +
+                            added_pts.get_level() +
+                            mutated_pts.get_level())
+
+        # Stat values (optional — used for current HP/food/etc.)
+        sv = StatValues()
+        ds.stat_values = sv
+
+        return ds
+
+    # ------------------------------------------------------------------
+    # Main lightweight loader
+    # ------------------------------------------------------------------
+    def get_all_lightweight(self, include_cryos: bool = True, include_wild: bool = True,
+                            include_tamed: bool = True) -> Dict[UUID, Dino]:
+        """Fastest path: single SQL scan + binary pattern extraction for stats.
+
+        1. Single SELECT reads entire game table into memory
+        2. Dino objects parsed from cached binary (blueprint filter)
+        3. Stat data extracted via binary pattern scan (no ArkGameObject for stats)
+        4. Dinos built with from_object() — no AI controller, no per-dino SQL
+
+        Cryopods still use the standard Cryopod constructor (few objects).
+        Read-only: resulting objects have no .binary / .save.
+        """
+        import time as _time
+        t0 = _time.time()
+
+        save_conn = self.save.save_connection
+        sc = save_conn.save_context
+        bp_filter = self._DEFAULT_CONFIG.blueprint_name_filter
+
+        # Enable lightweight mode — skip .bytes storage on ArkProperty
+        from arkparse.parsing.ark_property import ArkProperty as _AP
+        _AP._lightweight_mode = True
+
+        # ---- Phase 1: Single SQL scan — read entire game table ----
+        cursor = save_conn.connection.cursor()
+        cursor.execute("SELECT key, value FROM game")
+        raw_cache = {}          # uid → raw bytes (ALL rows)
+        dino_objects = {}       # uid → ArkGameObject (matching dinos only)
+        cryopod_raw = []        # (uid, ArkGameObject) for cryopods
+
+        for row in cursor:
+            uid = save_conn.byte_array_to_uuid(row[0])
+            raw_binary = row[1]
+            raw_cache[uid] = raw_binary
+
+            byte_buffer = ArkBinaryParser(raw_binary, sc)
+            class_name, _ = ArkGameObject.read_name(uid, byte_buffer)
+
+            if bp_filter and not bp_filter(class_name):
+                continue
+
+            # Parse full ArkGameObject for matching rows
+            try:
+                obj = ArkGameObject(uid, class_name, byte_buffer)
+                save_conn.parsed_objects[uid] = obj
+
+                if "Dinos/" in class_name and "_Character_" in class_name:
+                    dino_objects[uid] = obj
+                elif ("PrimalItem_SCSCryopod" in class_name or
+                      "PrimalItem_WeaponEmptyCryopod" in class_name):
+                    cryopod_raw.append((uid, obj))
+            except Exception:
+                continue
+
+        t1 = _time.time()
+        ArkSaveLogger.api_log(
+            f"[lightweight] single-pass scan: {len(raw_cache)} rows, "
+            f"{len(dino_objects)} dinos, {len(cryopod_raw)} cryopods in {t1 - t0:.2f}s")
+
+        # Store for get_all_objects() cache compatibility
+        self.all_objects = {**dino_objects}
+        for uid, obj in cryopod_raw:
+            self.all_objects[uid] = obj
+
+        # ---- Phase 2: Classify dinos + collect stat UUIDs ----
+        dino_entries = []
+        stat_uid_map = {}  # stat_uid → is_tamed
+
+        for uid, obj in dino_objects.items():
+            is_tamed = obj.get_property_value("TamedTimeStamp") is not None
+            stat_ref = obj.get_property_value("MyCharacterStatusComponent")
+            stat_uid = UUID(stat_ref.value) if stat_ref else None
+            if stat_uid:
+                stat_uid_map[stat_uid] = is_tamed
+            dino_entries.append((uid, obj, is_tamed, stat_uid))
+
+        t2 = _time.time()
+
+        # ---- Phase 3: Fast stat extraction from cached binary ----
+        patterns = self._build_stat_pattern(sc)
+        stat_results = {}  # stat_uid → DinoStats
+
+        for stat_uid, is_tamed in stat_uid_map.items():
+            binary = raw_cache.get(stat_uid)
+            if binary:
+                try:
+                    stat_results[stat_uid] = self._stats_from_binary(
+                        binary, patterns, is_tamed=is_tamed)
+                except Exception:
+                    stat_results[stat_uid] = None
+            else:
+                stat_results[stat_uid] = None
+
+        t3 = _time.time()
+        ArkSaveLogger.api_log(
+            f"[lightweight] fast stat extraction: {len(stat_results)} in {t3 - t2:.2f}s")
+
+        # ---- Phase 4: Build dinos ----
+        dinos = {}
+        for uid, obj, is_tamed, stat_uid in dino_entries:
+            try:
+                if is_tamed and not include_tamed:
+                    continue
+                if not is_tamed and not include_wild:
+                    continue
+
+                # Build dino without stats first
+                if is_tamed:
+                    dino = TamedDino()
+                    dino.object = obj
+                    dino.__init_props__()
+                    dino.cryopod = None
+                else:
+                    dino = Dino()
+                    dino.object = obj
+                    dino.__init_props__()
+
+                # Attach fast-extracted stats
+                stats = stat_results.get(stat_uid) if stat_uid else None
+                if stats is not None:
+                    dino.stats = stats
+                else:
+                    dino.stats = DinoStats()
+
+                dinos[uid] = dino
+                self.parsed_dinos[uid] = dino
+            except Exception as e:
+                if ArkSaveLogger._allow_invalid_objects:
+                    ArkSaveLogger.error_log(f"[lightweight] Failed dino {uid}: {e}")
+                else:
+                    raise
+
+        t4 = _time.time()
+        ArkSaveLogger.api_log(f"[lightweight] built {len(dinos)} dinos in {t4 - t3:.2f}s")
+
+        # ---- Phase 5: Cryopods (standard constructor, few objects) ----
+        if include_cryos and include_tamed:
+            for uid, obj in cryopod_raw:
+                try:
+                    if not obj.get_property_value("bIsEngram", default=False) and \
+                       obj.get_property_value("CustomItemDatas") is not None:
+                        if uid in self.parsed_cryopods:
+                            dino = self.parsed_cryopods[uid].dino
+                        else:
+                            cryopod = Cryopod(uid, save=self.save)
+                            self.parsed_cryopods[uid] = cryopod
+                            dino = cryopod.dino
+                            if dino:
+                                dino.is_cryopodded = True
+                        if dino is not None:
+                            dinos[dino.uuid] = dino
+                            self.parsed_dinos[dino.uuid] = dino
+                except Exception as e:
+                    if "Unsupported embedded data version" in str(e):
+                        continue
+                    if ArkSaveLogger._allow_invalid_objects:
+                        ArkSaveLogger.error_log(f"[lightweight] Cryopod {uid}: {e}")
+                    else:
+                        raise
+
+        t5 = _time.time()
+
+        # Free raw cache
+        del raw_cache
+        _AP._lightweight_mode = False  # Restore normal mode
+
+        ArkSaveLogger.api_log(
+            f"[lightweight] TOTAL: {len(dinos)} dinos in {t5 - t0:.2f}s "
+            f"(scan={t1-t0:.2f}s, classify={t2-t1:.2f}s, stats={t3-t2:.2f}s, "
+            f"build={t4-t3:.2f}s, cryopods={t5-t4:.2f}s)")
+
+        return dinos
+
     def get_at_location(self, map: ArkMap, coords: MapCoords, radius: float = 0.3, tamed: bool = True, untamed: bool = True) -> Dict[UUID, Dino]:
         dinos = self.get_all()
 

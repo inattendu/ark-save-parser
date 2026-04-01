@@ -456,6 +456,44 @@ class SaveConnection:
         
         return game_objects
 
+    def get_game_objects_batch(self, uuids) -> Dict[uuid.UUID, 'ArkGameObject']:
+        """Bulk-fetch game objects by UUID set using batched SQL IN queries.
+
+        Checks the parsed_objects cache first, then fetches uncached objects
+        from SQLite in batches of 900. All fetched objects are cached.
+        """
+        result = {}
+        uncached = []
+
+        for uid in uuids:
+            if uid in self.parsed_objects:
+                result[uid] = self.parsed_objects[uid]
+            else:
+                uncached.append(uid)
+
+        if not uncached:
+            return result
+
+        BATCH = 900
+        for i in range(0, len(uncached), BATCH):
+            batch = uncached[i:i + BATCH]
+            placeholders = ",".join("?" * len(batch))
+            query = f"SELECT key, value FROM game WHERE key IN ({placeholders})"
+            params = [self.uuid_to_byte_array(uid) for uid in batch]
+            cursor = self.connection.cursor()
+            cursor.execute(query, params)
+
+            for row in cursor:
+                uid = self.byte_array_to_uuid(row[0])
+                byte_buffer = ArkBinaryParser(row[1], self.save_context)
+                class_name, _ = ArkGameObject.read_name(uid, byte_buffer)
+                obj = self.parse_as_predefined_object(uid, class_name, byte_buffer)
+                if obj:
+                    self.parsed_objects[uid] = obj
+                    result[uid] = obj
+
+        return result
+
     def reset_caching(self):
         self.parsed_objects.clear()
 
