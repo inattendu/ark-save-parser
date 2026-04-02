@@ -35,8 +35,7 @@ class AsaSave:
         self.save_connection = None
         if use_connection:
             self.save_connection = SaveConnection(save_context=self.save_context, path=path, contents=contents, read_only=read_only)
-            if not skip_init:
-                self.initialize()
+            self.initialize(skip_game_time=skip_init)
 
     def __del__(self):
         self.close()
@@ -47,10 +46,11 @@ class AsaSave:
             return self.save_connection.faulty_objects
         return 0
 
-    def initialize(self):
+    def initialize(self, skip_game_time: bool = False):
         self.read_actor_locations()
         self.profile_data_in_db = self.profile_data_in_saves()
-        self._get_game_time_params()
+        if not skip_game_time:
+            self._get_game_time_params()
 
     def profile_data_in_saves(self) -> bool:
         parser: ArkBinaryParser = self.get_custom_value("GameModeCustomBytes")

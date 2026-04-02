@@ -353,7 +353,6 @@ class DinoApi:
 
         save_conn = self.save.save_connection
         sc = save_conn.save_context
-        bp_filter = self._DEFAULT_CONFIG.blueprint_name_filter
 
         # Enable lightweight mode — skip .bytes storage on ArkProperty
         from arkparse.parsing.ark_property import ArkProperty as _AP
@@ -363,80 +362,111 @@ class DinoApi:
         cursor = save_conn.connection.cursor()
         cursor.execute("SELECT key, value FROM game")
         raw_cache = {}          # uid → raw bytes (stat components only, not all rows)
-        dino_objects = {}       # uid → ArkGameObject (matching dinos only)
         cryopod_raw = []        # (uid, ArkGameObject) for cryopods
         _byte_to_uuid = save_conn.byte_array_to_uuid
         total_rows = 0
 
-        # Binary pre-filter markers (ASA saves store names as strings in binary)
-        _DINO_MARKER = b"Dinos/"
-        _CRYO_MARKER = b"Cryopod"
-        _STAT_MARKER = b"StatusComponent"
+        # Pre-compute name ID sets for fast classification (names stored as uint32 IDs)
+        import struct as _struct
+        _unpack_u32 = _struct.Struct('<I').unpack_from
+        _names = sc.names
+        _dino_name_ids = set()
+        _cryo_name_ids = set()
+        _stat_name_ids = set()
+        for _nid, _nval in _names.items():
+            if "Dinos/" in _nval and "_Character_" in _nval:
+                _dino_name_ids.add(_nid)
+            elif "Cryopod" in _nval:
+                _cryo_name_ids.add(_nid)
+            elif "StatusComponent" in _nval:
+                _stat_name_ids.add(_nid)
+
+        # Phase 2 binary patterns: extract TamedTimeStamp + MyCharacterStatusComponent
+        # without full ArkGameObject construction
+        _tamed_ts_nid = sc.get_name_id("TamedTimeStamp")
+        _status_comp_nid = sc.get_name_id("MyCharacterStatusComponent")
+        _obj_ref_type_nid = sc.get_name_id("ObjectProperty")
+        _tamed_ts_pattern = _struct.pack('<II', _tamed_ts_nid, 0) if _tamed_ts_nid else None
+        _status_pattern = None
+        if _status_comp_nid and _obj_ref_type_nid:
+            _status_pattern = _struct.pack('<IIII', _status_comp_nid, 0, _obj_ref_type_nid, 0)
+
+        dino_raw = {}           # uid → raw_binary (deferred parsing)
         skipped = 0
 
         for row in cursor:
             total_rows += 1
             raw_binary = row[1]
 
-            # Fast binary pre-filter: skip rows that can't be dinos, cryopods, or stat components
-            # Avoids creating ArkBinaryParser + read_name for ~60k irrelevant rows
-            raw_head = raw_binary[:300]
-            has_dino = _DINO_MARKER in raw_head
-            has_cryo = _CRYO_MARKER in raw_head if not has_dino else False
-            has_stat = _STAT_MARKER in raw_head
+            # Fast pre-filter: read first 4 bytes as name_id, classify without full parsing
+            if len(raw_binary) >= 4:
+                first_name_id = _unpack_u32(raw_binary, 0)[0]
+            else:
+                skipped += 1
+                continue
 
-            if not has_dino and not has_cryo:
-                if has_stat:
+            is_dino = first_name_id in _dino_name_ids
+            is_cryo = first_name_id in _cryo_name_ids
+            is_stat = first_name_id in _stat_name_ids
+
+            if not is_dino and not is_cryo:
+                if is_stat:
                     uid = _byte_to_uuid(row[0])
                     raw_cache[uid] = raw_binary
                 skipped += 1
                 continue
 
             uid = _byte_to_uuid(row[0])
-            byte_buffer = ArkBinaryParser(raw_binary, sc)
-            class_name, _ = ArkGameObject.read_name(uid, byte_buffer)
 
-            if bp_filter and not bp_filter(class_name):
-                if has_stat:
-                    raw_cache[uid] = raw_binary
-                continue
-
-            # Parse full ArkGameObject for matching rows
-            try:
-                obj = ArkGameObject(uid, class_name, byte_buffer)
-                save_conn.parsed_objects[uid] = obj
-
-                if has_dino:
-                    dino_objects[uid] = obj
-                elif has_cryo:
+            if is_cryo:
+                # Cryopods still need full ArkGameObject (few objects)
+                byte_buffer = ArkBinaryParser(raw_binary, sc)
+                class_name, _ = ArkGameObject.read_name(uid, byte_buffer)
+                try:
+                    obj = ArkGameObject(uid, class_name, byte_buffer)
+                    save_conn.parsed_objects[uid] = obj
                     cryopod_raw.append((uid, obj))
-            except Exception:
-                continue
+                except Exception:
+                    pass
+            else:
+                # Dinos: defer ArkGameObject construction — store raw binary
+                dino_raw[uid] = raw_binary
 
         t1 = _time.time()
         ArkSaveLogger.api_log(
-            f"[lightweight] single-pass scan: {total_rows} rows ({skipped} skipped by pre-filter), "
+            f"[lightweight] Phase 1 scan: {total_rows} rows ({skipped} skipped), "
             f"{len(raw_cache)} stat cache, "
-            f"{len(dino_objects)} dinos, {len(cryopod_raw)} cryopods in {t1 - t0:.2f}s")
+            f"{len(dino_raw)} dino raw, {len(cryopod_raw)} cryopods in {t1 - t0:.2f}s")
 
-        # Store for get_all_objects() cache compatibility
-        self.all_objects = {**dino_objects}
-        for uid, obj in cryopod_raw:
-            self.all_objects[uid] = obj
+        # ---- Phase 2: Classify dinos via binary scan (no ArkGameObject needed) ----
+        dino_entries = []       # (uid, raw_binary, is_tamed, stat_uid)
+        stat_uid_map = {}       # stat_uid → is_tamed
 
-        # ---- Phase 2: Classify dinos + collect stat UUIDs ----
-        dino_entries = []
-        stat_uid_map = {}  # stat_uid → is_tamed
+        for uid, raw_binary in dino_raw.items():
+            is_tamed = _tamed_ts_pattern is not None and _tamed_ts_pattern in raw_binary
 
-        for uid, obj in dino_objects.items():
-            is_tamed = obj.get_property_value("TamedTimeStamp") is not None
-            stat_ref = obj.get_property_value("MyCharacterStatusComponent")
-            stat_uid = UUID(stat_ref.value) if stat_ref else None
+            stat_uid = None
+            if _status_pattern:
+                pos = raw_binary.find(_status_pattern)
+                if pos != -1:
+                    # ObjectProperty format: pattern(16) + data_size(4) + position(4)
+                    # + is_pos_flag(1) + type(2) + UUID(16) = offset +27
+                    val_offset = pos + 27
+                    if val_offset + 16 <= len(raw_binary):
+                        try:
+                            stat_uid = UUID(bytes=raw_binary[val_offset:val_offset + 16])
+                        except Exception:
+                            pass
+
             if stat_uid:
                 stat_uid_map[stat_uid] = is_tamed
-            dino_entries.append((uid, obj, is_tamed, stat_uid))
+            dino_entries.append((uid, raw_binary, is_tamed, stat_uid))
 
         t2 = _time.time()
+        ArkSaveLogger.api_log(
+            f"[lightweight] Phase 2 classify: {len(dino_entries)} dinos, "
+            f"{sum(1 for _, _, t, _ in dino_entries if t)} tamed, "
+            f"{len(stat_uid_map)} stat refs in {t2 - t1:.2f}s")
 
         # ---- Phase 3: Fast stat extraction from cached binary ----
         patterns = self._build_stat_pattern(sc)
@@ -458,27 +488,71 @@ class DinoApi:
             f"[lightweight] fast stat extraction: {len(stat_results)} in {t3 - t2:.2f}s")
 
         # ---- Phase 4: Build dinos ----
+        # Wild dinos: built directly from binary data (no ArkGameObject needed)
+        # Tamed dinos: full ArkGameObject construction (few objects)
         dinos = {}
-        for uid, obj, is_tamed, stat_uid in dino_entries:
+
+        # Pre-compute binary patterns for wild dino properties
+        _is_female_nid = sc.get_name_id("bIsFemale")
+        _bool_type_nid = sc.get_name_id("BoolProperty")
+        _female_pattern = None
+        if _is_female_nid and _bool_type_nid:
+            _female_pattern = _struct.pack('<IIII', _is_female_nid, 0, _bool_type_nid, 0)
+
+        _name_to_blueprint = _names  # name_id → blueprint string
+
+        for uid, raw_binary, is_tamed, stat_uid in dino_entries:
             try:
                 if is_tamed and not include_tamed:
                     continue
                 if not is_tamed and not include_wild:
                     continue
 
-                # Build dino without stats first
+                stats = stat_results.get(stat_uid) if stat_uid else None
+
                 if is_tamed:
+                    # Tamed: full parse (few objects, ~15)
+                    byte_buffer = ArkBinaryParser(raw_binary, sc)
+                    class_name, _ = ArkGameObject.read_name(uid, byte_buffer)
+                    obj = ArkGameObject(uid, class_name, byte_buffer)
+                    save_conn.parsed_objects[uid] = obj
+
                     dino = TamedDino()
                     dino.object = obj
                     dino.__init_props__()
                     dino.cryopod = None
                 else:
-                    dino = Dino()
-                    dino.object = obj
-                    dino.__init_props__()
+                    # Wild: lightweight construction (no ArkGameObject, no property parsing)
+                    # Extract blueprint from name_id
+                    first_name_id = _unpack_u32(raw_binary, 0)[0]
+                    blueprint = _name_to_blueprint.get(first_name_id, "Unknown")
 
-                # Attach fast-extracted stats
-                stats = stat_results.get(stat_uid) if stat_uid else None
+                    # Extract bIsFemale from binary
+                    is_female = False
+                    if _female_pattern:
+                        fpos = raw_binary.find(_female_pattern)
+                        if fpos != -1:
+                            # After 16-byte pattern: data_size(4) + position(4) + bool_value(1)
+                            val_off = fpos + 24
+                            if val_off < len(raw_binary):
+                                is_female = raw_binary[val_off] != 0
+
+                    # Get location from actor transforms
+                    location = sc.actor_transforms.get(uid)
+
+                    # Build Dino directly without ArkGameObject
+                    dino = Dino.__new__(Dino)
+                    dino.object = ArkGameObject.__new__(ArkGameObject)
+                    dino.object.uuid = uid
+                    dino.object.blueprint = blueprint
+                    dino.object.properties = []
+                    dino.is_female = is_female
+                    dino.is_cryopodded = False
+                    dino.is_dead = False
+                    dino.gene_traits = []
+                    dino.id_ = None
+                    dino._location = location if location else ActorTransform()
+
                 if stats is not None:
                     dino.stats = stats
                 else:
@@ -494,6 +568,9 @@ class DinoApi:
 
         t4 = _time.time()
         ArkSaveLogger.api_log(f"[lightweight] built {len(dinos)} dinos in {t4 - t3:.2f}s")
+
+        # Store for get_all_objects() cache compatibility
+        self.all_objects = dict(save_conn.parsed_objects)
 
         # ---- Phase 5: Cryopods (standard constructor, few objects) ----
         if include_cryos and include_tamed:
