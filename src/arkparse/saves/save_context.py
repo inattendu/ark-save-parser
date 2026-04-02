@@ -11,6 +11,7 @@ from .header_location import HeaderLocation
 class SaveContext:
     def __init__(self):
         self.names: Dict[int, str] = {}
+        self._name_reverse: Dict[str, int] = {}  # reverse lookup: name -> id
         self.constant_name_table: Optional[Dict[int, str]] = None
         self.some_other_table: Optional[Dict[int, str]] = None
         self.sections: List[HeaderLocation] = []
@@ -54,20 +55,22 @@ class SaveContext:
             json.dump(self.names, f, indent=4)
 
     def get_name_id(self, name: str) -> Optional[int]:
-        for key, value in self.names.items():
-            if value == name:
-                return key
-        
-        return None
+        return self._name_reverse.get(name)
+
+    def _rebuild_reverse_cache(self) -> None:
+        """Rebuild the reverse name lookup from self.names."""
+        self._name_reverse = {v: k for k, v in self.names.items()}
 
     def add_new_name(self, name: str, id: int = None) -> int:
         if id is not None:
             self.names[id] = name
+            self._name_reverse[name] = id
             return id
-    
+
         new_id = random.randint(0, int(2**31 - 1))
         while new_id in self.names:
             new_id = random.randint(0, int(2**31 - 1))
         self.names[new_id] = name
-        
+        self._name_reverse[name] = new_id
+
         return new_id

@@ -45,6 +45,13 @@ class SaveConnection:
         conn_str = f"file:{temp_save_path}?mode={'ro' if read_only else 'rw'}"
         self.connection = sqlite3.connect(conn_str, uri=True)
 
+        # Optimize SQLite for read-heavy workloads
+        if read_only:
+            self.connection.execute("PRAGMA synchronous = OFF")
+            self.connection.execute("PRAGMA journal_mode = OFF")
+        self.connection.execute("PRAGMA cache_size = -500000")  # 500MB
+        self.connection.execute("PRAGMA mmap_size = 268435456")  # 256MB mmap
+
         self.list_all_items_in_db()
         self.read_header()
 
@@ -101,6 +108,7 @@ class SaveConnection:
         # check_uint64(header_data, 0)
         header_data.set_position(name_table_offset)
         self.save_context.names = self.read_table(header_data)
+        self.save_context._rebuild_reverse_cache()
 
     def read_actor_locations(self):
         actor_transforms = self.get_custom_value("ActorTransforms")
