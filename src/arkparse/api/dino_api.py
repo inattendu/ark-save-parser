@@ -362,19 +362,24 @@ class DinoApi:
         # ---- Phase 1: Single SQL scan — read entire game table ----
         cursor = save_conn.connection.cursor()
         cursor.execute("SELECT key, value FROM game")
-        raw_cache = {}          # uid → raw bytes (ALL rows)
+        raw_cache = {}          # uid → raw bytes (stat components only, not all rows)
         dino_objects = {}       # uid → ArkGameObject (matching dinos only)
         cryopod_raw = []        # (uid, ArkGameObject) for cryopods
+        _byte_to_uuid = save_conn.byte_array_to_uuid
+        total_rows = 0
 
         for row in cursor:
-            uid = save_conn.byte_array_to_uuid(row[0])
+            total_rows += 1
+            uid = _byte_to_uuid(row[0])
             raw_binary = row[1]
-            raw_cache[uid] = raw_binary
 
             byte_buffer = ArkBinaryParser(raw_binary, sc)
             class_name, _ = ArkGameObject.read_name(uid, byte_buffer)
 
             if bp_filter and not bp_filter(class_name):
+                # Only cache stat component binaries for Phase 3 extraction
+                if b"StatusComponent" in raw_binary[:200]:
+                    raw_cache[uid] = raw_binary
                 continue
 
             # Parse full ArkGameObject for matching rows
@@ -392,7 +397,8 @@ class DinoApi:
 
         t1 = _time.time()
         ArkSaveLogger.api_log(
-            f"[lightweight] single-pass scan: {len(raw_cache)} rows, "
+            f"[lightweight] single-pass scan: {total_rows} rows, "
+            f"{len(raw_cache)} stat cache, "
             f"{len(dino_objects)} dinos, {len(cryopod_raw)} cryopods in {t1 - t0:.2f}s")
 
         # Store for get_all_objects() cache compatibility

@@ -130,21 +130,15 @@ class SaveConnection:
         return class_name
 
     def list_all_items_in_db(self):
-        query = "SELECT key, value FROM game"
-        with self.connection as conn:
-            cursor = conn.execute(query)
-            name = cursor.description
-            rowCount = 0
-            for row in cursor:
-                rowCount += 1
-            ArkSaveLogger.save_log(f"Found {rowCount} items in game table")
+        cursor = self.connection.cursor()
+        cursor.execute("SELECT COUNT(*) FROM game")
+        rowCount = cursor.fetchone()[0]
+        ArkSaveLogger.save_log(f"Found {rowCount} items in game table")
 
         # get custom values
-        query = "SELECT key, value FROM custom"
-        with self.connection as conn:
-            cursor = conn.execute(query)
-            for row in cursor:
-                ArkSaveLogger.save_log(f"Custom key: {row[0]}")
+        cursor.execute("SELECT key FROM custom")
+        for row in cursor:
+            ArkSaveLogger.save_log(f"Custom key: {row[0]}")
 
     def add_name_to_name_table(self, name: str, id: Optional[int] = None):
         header_data = self.get_custom_value("SaveHeader")

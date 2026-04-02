@@ -17,7 +17,7 @@ class AsaSave:
     # Populate manually if constructor parameter use_connection is False
     
 
-    def __init__(self, path: Path = None, contents: bytes = None, read_only: bool = False, use_connection: bool = True):
+    def __init__(self, path: Path = None, contents: bytes = None, read_only: bool = False, use_connection: bool = True, skip_init: bool = False):
 
         self.save_context = SaveContext()
         self.parsed_objects: Dict[uuid.UUID, ArkGameObject] = {}
@@ -35,7 +35,8 @@ class AsaSave:
         self.save_connection = None
         if use_connection:
             self.save_connection = SaveConnection(save_context=self.save_context, path=path, contents=contents, read_only=read_only)
-            self.initialize()
+            if not skip_init:
+                self.initialize()
 
     def __del__(self):
         self.close()
