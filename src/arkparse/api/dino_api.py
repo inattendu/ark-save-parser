@@ -368,17 +368,36 @@ class DinoApi:
         _byte_to_uuid = save_conn.byte_array_to_uuid
         total_rows = 0
 
+        # Binary pre-filter markers (ASA saves store names as strings in binary)
+        _DINO_MARKER = b"Dinos/"
+        _CRYO_MARKER = b"Cryopod"
+        _STAT_MARKER = b"StatusComponent"
+        skipped = 0
+
         for row in cursor:
             total_rows += 1
-            uid = _byte_to_uuid(row[0])
             raw_binary = row[1]
 
+            # Fast binary pre-filter: skip rows that can't be dinos, cryopods, or stat components
+            # Avoids creating ArkBinaryParser + read_name for ~60k irrelevant rows
+            raw_head = raw_binary[:300]
+            has_dino = _DINO_MARKER in raw_head
+            has_cryo = _CRYO_MARKER in raw_head if not has_dino else False
+            has_stat = _STAT_MARKER in raw_head
+
+            if not has_dino and not has_cryo:
+                if has_stat:
+                    uid = _byte_to_uuid(row[0])
+                    raw_cache[uid] = raw_binary
+                skipped += 1
+                continue
+
+            uid = _byte_to_uuid(row[0])
             byte_buffer = ArkBinaryParser(raw_binary, sc)
             class_name, _ = ArkGameObject.read_name(uid, byte_buffer)
 
             if bp_filter and not bp_filter(class_name):
-                # Only cache stat component binaries for Phase 3 extraction
-                if b"StatusComponent" in raw_binary[:200]:
+                if has_stat:
                     raw_cache[uid] = raw_binary
                 continue
 
@@ -387,17 +406,16 @@ class DinoApi:
                 obj = ArkGameObject(uid, class_name, byte_buffer)
                 save_conn.parsed_objects[uid] = obj
 
-                if "Dinos/" in class_name and "_Character_" in class_name:
+                if has_dino:
                     dino_objects[uid] = obj
-                elif ("PrimalItem_SCSCryopod" in class_name or
-                      "PrimalItem_WeaponEmptyCryopod" in class_name):
+                elif has_cryo:
                     cryopod_raw.append((uid, obj))
             except Exception:
                 continue
 
         t1 = _time.time()
         ArkSaveLogger.api_log(
-            f"[lightweight] single-pass scan: {total_rows} rows, "
+            f"[lightweight] single-pass scan: {total_rows} rows ({skipped} skipped by pre-filter), "
             f"{len(raw_cache)} stat cache, "
             f"{len(dino_objects)} dinos, {len(cryopod_raw)} cryopods in {t1 - t0:.2f}s")
 
